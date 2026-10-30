@@ -23,6 +23,17 @@ struct Stored {
     mcp: McpSettings,
 }
 
+/// Ferrite's configuration directory: `FERRITE_CONFIG_DIR`, or
+/// `<platform config dir>/ferrite` (for example `~/.config/ferrite`).
+pub fn config_dir() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("FERRITE_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(dirs::config_dir()
+        .context("Cannot locate the application configuration directory")?
+        .join("ferrite"))
+}
+
 pub struct Preferences {
     path: PathBuf,
     stored: Stored,
@@ -30,10 +41,7 @@ pub struct Preferences {
 
 impl Preferences {
     pub fn load(project: &Project) -> Result<Self> {
-        let dir = dirs::config_dir()
-            .context("Cannot locate the application configuration directory")?
-            .join("ferrite");
-        Self::load_at(&dir.join("settings.json"), project)
+        Self::load_at(&config_dir()?.join("settings.json"), project)
     }
 
     pub fn load_at(path: &Path, project: &Project) -> Result<Self> {

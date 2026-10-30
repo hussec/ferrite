@@ -354,3 +354,37 @@ impl Workspace {
 fn default_enabled() -> bool {
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspaces_from_older_versions_gain_repeater_ids() {
+        // A v0.1.1 workspace: Repeater tabs have no id or group.
+        let mut old = serde_json::to_value(Workspace::default()).unwrap();
+        let tab = serde_json::json!({
+            "name": "1", "destination": "https://a.test", "request": "GET / HTTP/1.1\r\n\r\n", "history": [3]
+        });
+        old["repeater"] = serde_json::json!([tab.clone(), tab]);
+        old["history_filter"]
+            .as_object_mut()
+            .unwrap()
+            .remove("annotated_only");
+        let mut workspace: Workspace = serde_json::from_value(old).unwrap();
+        assert!(
+            workspace
+                .repeater
+                .iter()
+                .all(|t| t.id == 0 && t.group.is_empty())
+        );
+        workspace.assign_repeater_ids();
+        assert_eq!(
+            workspace.repeater.iter().map(|t| t.id).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(workspace.repeater_tab(2).unwrap().history, [3]);
+        assert_eq!(workspace.next_repeater_id(), 3);
+        assert!(!workspace.history_filter.annotated_only);
+    }
+}

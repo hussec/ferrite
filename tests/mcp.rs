@@ -205,7 +205,7 @@ fn relay_drives_a_running_ferrite_instance() {
     });
     let mut client = Client::spawn(&["--endpoint-file", endpoint.to_str().unwrap()], &[]);
     let names = tool_names(&mut client);
-    assert!(names.len() >= 22, "{names:?}");
+    assert!(names.len() >= 23, "{names:?}");
     for name in [
         "send_http_request",
         "get_site_map",
@@ -338,6 +338,30 @@ fn relay_drives_a_running_ferrite_instance() {
                 .contains("Unknown argument")
     );
 
+    // Annotations made by the client are visible in Ferrite's History.
+    client.ok(
+        "annotate_http_exchange",
+        json!({"ids": [id], "comment": "IDOR candidate", "highlight": "Red"}),
+    );
+    let annotated = client.ok("list_http_history", json!({"url_contains": "id=1"}));
+    assert_eq!(annotated["items"][0]["comment"], "IDOR candidate");
+    assert_eq!(annotated["items"][0]["highlight"], "Red");
+    assert_eq!(
+        engine
+            .project
+            .lock()
+            .unwrap()
+            .annotation(id)
+            .unwrap()
+            .comment,
+        "IDOR candidate"
+    );
+    let (missing, error) = client.call(
+        "annotate_http_exchange",
+        json!({"ids": [999], "comment": "x"}),
+    );
+    assert!(error && missing["error"].as_str().unwrap().contains("do not exist"));
+
     // Repeater: the tab is visible in Ferrite and records its sends.
     let tab = client.ok(
         "send_to_repeater",
@@ -464,11 +488,7 @@ fn headless_mode_owns_the_project_exclusively() {
             project.to_str().unwrap(),
             "--allow-requests",
         ],
-        &[
-            ("HOME", &home),
-            ("XDG_CONFIG_HOME", &home),
-            ("APPDATA", &home),
-        ],
+        &[("FERRITE_CONFIG_DIR", &home)],
     );
     let info = client.ok("get_project_info", json!({}));
     assert_eq!(info["storage"], "disk");
@@ -498,15 +518,12 @@ fn headless_mode_without_preauthorisation_denies_network_tools() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     std::fs::create_dir(&home).unwrap();
-    let mut client = Client::spawn(
-        &["--headless"],
-        &[
-            ("HOME", &home),
-            ("XDG_CONFIG_HOME", &home),
-            ("APPDATA", &home),
-        ],
-    );
+    let mut client = Client::spawn(&["--headless"], &[("FERRITE_CONFIG_DIR", &home)]);
     let info = client.ok("get_project_info", json!({}));
+    assert!(
+        home.join("settings.json").exists(),
+        "preferences honour FERRITE_CONFIG_DIR"
+    );
     assert_eq!(info["mcp"]["send_requests"], "Deny");
     assert_eq!(info["storage"], "temporary (memory)");
 }

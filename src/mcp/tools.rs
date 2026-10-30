@@ -12,7 +12,7 @@ use super::{
 };
 use crate::{
     engine::Engine,
-    history::short_content_type,
+    history::{Annotation, Highlight, short_content_type},
     http::{self, Message},
     model::{Destination, Exchange, RepeaterTab, Scope},
     scanner::{Confidence, ReviewState, ScanStatus, Severity},
@@ -255,6 +255,22 @@ pub fn catalogue() -> Vec<ToolSpec> {
                 &[],
             ),
         ),
+        ToolSpec {
+            name: "annotate_http_exchange",
+            title: "Annotate exchanges",
+            description: "Set the comment and/or highlight colour of history exchanges so the Ferrite user sees your notes in History. An empty comment or highlight \"none\" clears it. No traffic is sent.",
+            schema: object(
+                json!({
+                    "ids": {"type": "array", "items": {"type": "integer"}, "minItems": 1, "maxItems": 200},
+                    "comment": {"type": "string", "maxLength": 2000},
+                    "highlight": {"type": "string", "enum": ["Red", "Orange", "Yellow", "Green", "Cyan", "Blue", "Purple", "Grey", "none"]}
+                }),
+                &["ids"],
+            ),
+            read_only: false,
+            destructive: false,
+            open_world: false,
+        },
         ToolSpec {
             name: "send_to_repeater",
             title: "Send to Repeater",
@@ -563,6 +579,7 @@ async fn dispatch(host: &Arc<Host>, caller: &Caller, tool: &str, arguments: Valu
         "get_site_map" => site_map(&engine, parse(arguments)?).await,
         "list_hosts" => list_hosts(&engine, parse(arguments)?).await,
         "list_endpoints" => list_endpoints(&engine, parse(arguments)?).await,
+        "annotate_http_exchange" => annotate(&engine, parse(arguments)?).await,
         "send_to_repeater" => send_to_repeater(&engine, parse(arguments)?).await,
         "list_repeater_tabs" => Ok(list_repeater_tabs(&engine).into()),
         "get_repeater_request" => get_repeater_request(&engine, parse(arguments)?, redact),
@@ -654,7 +671,8 @@ fn chunk(bytes: &[u8], offset: usize, max: usize, encoding: Encoding) -> Value {
     })
 }
 
-fn summary(flow: &Exchange, scope: &Scope) -> Value {
+fn summary(flow: &Exchange, scope: &Scope, annotations: &BTreeMap<u64, Annotation>) -> Value {
+    let annotation = annotations.get(&flow.id);
     json!({
         "id": flow.id,
         "time": time(flow.timestamp_ms),
@@ -669,6 +687,8 @@ fn summary(flow: &Exchange, scope: &Scope) -> Value {
         "duration_ms": flow.duration_ms,
         "in_scope": scope.contains(&flow.url),
         "error": flow.error,
+        "comment": annotation.map(|a| a.comment.as_str()).filter(|c| !c.is_empty()),
+        "highlight": annotation.and_then(|a| a.highlight).map(Highlight::label),
     })
 }
 
@@ -838,7 +858,10 @@ struct ListArgs {
 }
 
 async fn list_history(engine: &Arc<Engine>, args: ListArgs) -> Outcome2 {
-    let reader = engine.project.lock().unwrap().history_reader();
+    let (reader, annotations) = {
+        let project = engine.project.lock().unwrap();
+        (project.history_reader(), project.annotations().clone())
+    };
     let scope = engine.settings().scope;
     let limit = limit(args.limit);
     let before = cursor(&args.cursor)?;
@@ -856,7 +879,7 @@ async fn list_history(engine: &Arc<Engine>, args: ListArgs) -> Outcome2 {
             scanned += 1;
             last = Some(flow.id);
             if filter.matches(&flow, &scope) {
-                items.push(summary(&flow, &scope));
+                items.push(summary(&flow, &scope, &annotations));
             }
             Ok(true)
         })?;
@@ -983,7 +1006,10 @@ struct SearchArgs {
 }
 
 async fn search_history(engine: &Arc<Engine>, args: SearchArgs, redact: bool) -> Outcome2 {
-    let reader = engine.project.lock().unwrap().history_reader();
+    let (reader, annotations) = {
+        let project = engine.project.lock().unwrap();
+        (project.history_reader(), project.annotations().clone())
+    };
     let scope = engine.settings().scope;
     let limit = limit(args.limit);
     let before = cursor(&args.cursor)?;
@@ -1044,7 +1070,7 @@ async fn search_history(engine: &Arc<Engine>, args: SearchArgs, redact: bool) ->
                 }
             }
             if !matches.is_empty() {
-                let mut item = summary(&flow, &scope);
+                let mut item = summary(&flow, &scope, &annotations);
                 item["matches"] = json!(matches);
                 items.push(item);
             }
@@ -1341,6 +1367,61 @@ async fn list_endpoints(engine: &Arc<Engine>, args: EndpointArgs) -> Outcome2 {
     })
     .await?;
     Ok(value.into())
+}
+
+#[derive(Deserialize)]
+struct AnnotateArgs {
+    ids: Vec<u64>,
+    comment: Option<String>,
+    highlight: Option<String>,
+}
+
+async fn annotate(engine: &Arc<Engine>, args: AnnotateArgs) -> Outcome2 {
+    if args.comment.is_none() && args.highlight.is_none() {
+        return Err(anyhow!("Provide comment and/or highlight").into());
+    }
+    let highlight = match args.highlight.as_deref() {
+        None => None,
+        Some(label) if label.eq_ignore_ascii_case("none") => Some(None),
+        Some(label) => Some(Some(
+            Highlight::parse(label).with_context(|| format!("Unknown highlight {label}"))?,
+        )),
+    };
+    let reader = engine.project.lock().unwrap().history_reader();
+    let ids = args.ids.clone();
+    let missing = blocking(move || {
+        Ok(ids
+            .into_iter()
+            .filter(|id| !matches!(reader.get(*id), Ok(Some(_))))
+            .collect::<Vec<_>>())
+    })
+    .await?;
+    if !missing.is_empty() {
+        return Err(anyhow!("Exchanges do not exist: {missing:?}").into());
+    }
+    let mut project = engine.project.lock().unwrap();
+    let changes: Vec<_> = args
+        .ids
+        .iter()
+        .map(|id| {
+            let mut annotation = project.annotation(*id).cloned().unwrap_or_default();
+            if let Some(comment) = &args.comment {
+                annotation.comment = comment.trim().chars().take(2000).collect();
+            }
+            if let Some(highlight) = highlight {
+                annotation.highlight = highlight;
+            }
+            (*id, annotation)
+        })
+        .collect();
+    project.set_annotations(&changes)?;
+    drop(project);
+    engine.activity.fetch_add(1, Ordering::SeqCst);
+    Ok(Done {
+        value: json!({"annotated": args.ids}),
+        summary: Some(format!("{} exchange(s)", args.ids.len())),
+        exchanges: vec![],
+    })
 }
 
 fn tab_bytes(tab: &RepeaterTab) -> Result<Vec<u8>> {
@@ -2039,6 +2120,7 @@ mod tests {
             "get_site_map",
             "list_hosts",
             "list_endpoints",
+            "annotate_http_exchange",
             "send_to_repeater",
             "list_repeater_tabs",
             "get_repeater_request",

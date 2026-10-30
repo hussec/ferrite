@@ -1,5 +1,6 @@
 //! Repeater tabs, grouped into collections, with an ID-based merge so tabs
 //! created or sent by MCP clients are never overwritten by the UI.
+use super::comparer_view::Slot;
 use super::{
     Event, Workbench, decode_editor, editable, editor_context, entry_menu, hex_headers,
     http_editor, item_menu, split_panes, subsection_heading,
@@ -299,6 +300,31 @@ impl Workbench {
                     self.repeater_flow = Some(tab.history[self.repeater_cursor]);
                 }
                 ui.label(format!("{} saved sends", tab.history.len()));
+                if tab.history.len() >= 2
+                    && ui
+                        .button("Compare with previous")
+                        .on_hover_text("Open this response and the send before it in Comparer")
+                        .clicked()
+                {
+                    let current = self.repeater_cursor.clamp(1, tab.history.len() - 1);
+                    let ids = [tab.history[current - 1], tab.history[current]];
+                    let found: Vec<_> = ids
+                        .iter()
+                        .filter_map(|id| self.rows.iter().find(|r| r.id == *id).cloned())
+                        .collect();
+                    if let [previous, shown] = found.as_slice() {
+                        self.comparer.set(
+                            Slot::A,
+                            format!("#{} response", previous.id),
+                            &previous.response,
+                        );
+                        self.send_to_comparer(
+                            Slot::B,
+                            format!("#{} response", shown.id),
+                            &shown.response,
+                        );
+                    }
+                }
             });
             let flow = self
                 .repeater_flow
@@ -320,6 +346,18 @@ impl Workbench {
                     tab.request_hex = h;
                 }
             }
+            let response = flow
+                .as_ref()
+                .map(|f| {
+                    self.response_cache.get(
+                        f.id,
+                        &f.response,
+                        self.response_hex,
+                        self.engine.settings().max_message_bytes,
+                    )
+                })
+                .unwrap_or_default();
+            super::highlight::find_bar(ui, &[("request", &tab.request), ("response", &response)]);
             ui.separator();
             let [mut request_ui, mut response_ui] = split_panes(ui, "repeater-editors", false, 0.5);
             subsection_heading(&mut request_ui, "Request");
@@ -343,17 +381,6 @@ impl Workbench {
             if let Some(action) = action {
                 editor_action = Some((action, editor_context::repeater(tab)));
             }
-            let response = flow
-                .as_ref()
-                .map(|f| {
-                    self.response_cache.get(
-                        f.id,
-                        &f.response,
-                        self.response_hex,
-                        self.engine.settings().max_message_bytes,
-                    )
-                })
-                .unwrap_or_default();
             let response_output = http_editor(
                 &mut response_ui,
                 &mut response.as_ref(),

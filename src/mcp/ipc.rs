@@ -78,15 +78,12 @@ enum ServerMessage {
 }
 
 /// The endpoint file location: `FERRITE_MCP_ENDPOINT`, or
-/// `<config dir>/ferrite/mcp-endpoint.json`.
+/// `mcp-endpoint.json` in Ferrite's configuration directory.
 pub fn default_endpoint_path() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("FERRITE_MCP_ENDPOINT") {
         return Ok(PathBuf::from(path));
     }
-    Ok(dirs::config_dir()
-        .context("Cannot locate the application configuration directory")?
-        .join("ferrite")
-        .join("mcp-endpoint.json"))
+    Ok(crate::preferences::config_dir()?.join("mcp-endpoint.json"))
 }
 
 pub fn read_endpoint(path: &Path) -> Result<Endpoint> {

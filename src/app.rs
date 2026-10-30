@@ -10,7 +10,10 @@ use crate::{
 use eframe::egui::{self, Color32, RichText};
 mod alerts;
 mod browser_view;
+mod comparer_view;
+mod decoder_view;
 mod editor_context;
+mod highlight;
 mod history_export;
 mod history_filters;
 mod history_selection;
@@ -48,6 +51,8 @@ enum Page {
     Repeater,
     Intruder,
     Scanner,
+    Decoder,
+    Comparer,
     Proxy,
     Browser,
     Mcp,
@@ -143,6 +148,10 @@ pub struct Workbench {
     browser: browser_view::State,
     mcp: Arc<crate::mcp::host::Host>,
     mcp_view: mcp_view::State,
+    decoder: decoder_view::State,
+    comparer: comparer_view::State,
+    /// Exchanges whose comment is being edited, with the draft text.
+    comment_edit: Option<(Vec<u64>, String)>,
 }
 fn hex(bytes: &[u8]) -> String {
     http::hex_dump(bytes)
@@ -326,6 +335,16 @@ enum EntryAction {
     CopyUrl,
     CopyCurl,
     CopyPython,
+    /// Copy the request (false) or response (true) as text.
+    CopyMessage(bool),
+    /// Send the request (false) or response (true) to a Comparer slot.
+    Comparer(bool, comparer_view::Slot),
+    /// Send the request (false) or response (true) to Decoder.
+    Decoder(bool),
+    /// Set or clear the highlight colour of stored exchanges.
+    Highlight(Option<crate::history::Highlight>),
+    /// Edit the comment of stored exchanges.
+    Comment,
     Repeater,
     Intruder,
     Scanner,
@@ -345,6 +364,8 @@ fn item_menu(response: &egui::Response, export: bool, delete: Option<&str>) -> O
         ui.menu_button("Copy", |ui| {
             for (label, value) in [
                 ("URL", EntryAction::CopyUrl),
+                ("Request", EntryAction::CopyMessage(false)),
+                ("Response", EntryAction::CopyMessage(true)),
                 ("as curl", EntryAction::CopyCurl),
                 ("as Python requests", EntryAction::CopyPython),
             ] {
@@ -365,6 +386,42 @@ fn item_menu(response: &egui::Response, export: bool, delete: Option<&str>) -> O
                     ui.close();
                 }
             }
+            ui.menu_button("Comparer", |ui| {
+                for (label, value) in [
+                    (
+                        "Request as A",
+                        EntryAction::Comparer(false, comparer_view::Slot::A),
+                    ),
+                    (
+                        "Request as B",
+                        EntryAction::Comparer(false, comparer_view::Slot::B),
+                    ),
+                    (
+                        "Response as A",
+                        EntryAction::Comparer(true, comparer_view::Slot::A),
+                    ),
+                    (
+                        "Response as B",
+                        EntryAction::Comparer(true, comparer_view::Slot::B),
+                    ),
+                ] {
+                    if ui.button(label).clicked() {
+                        action = Some(value);
+                        ui.close();
+                    }
+                }
+            });
+            ui.menu_button("Decoder", |ui| {
+                for (label, value) in [
+                    ("Request", EntryAction::Decoder(false)),
+                    ("Response", EntryAction::Decoder(true)),
+                ] {
+                    if ui.button(label).clicked() {
+                        action = Some(value);
+                        ui.close();
+                    }
+                }
+            });
         });
         ui.separator();
         if let Some(label) = delete
@@ -400,6 +457,29 @@ fn item_menu(response: &egui::Response, export: bool, delete: Option<&str>) -> O
         }
         if export {
             ui.separator();
+            ui.menu_button("Highlight", |ui| {
+                for colour in crate::history::Highlight::ALL {
+                    let [r, g, b] = colour.rgb();
+                    if ui
+                        .button(
+                            RichText::new(format!("■ {}", colour.label()))
+                                .color(Color32::from_rgb(r, g, b)),
+                        )
+                        .clicked()
+                    {
+                        action = Some(EntryAction::Highlight(Some(colour)));
+                        ui.close();
+                    }
+                }
+                if ui.button("None").clicked() {
+                    action = Some(EntryAction::Highlight(None));
+                    ui.close();
+                }
+            });
+            if ui.button("Comment…").clicked() {
+                action = Some(EntryAction::Comment);
+                ui.close();
+            }
             if ui.button("Export selected items").clicked() {
                 action = Some(EntryAction::Export);
                 ui.close();
@@ -516,6 +596,9 @@ impl Workbench {
             browser: browser_view::State::default(),
             mcp,
             mcp_view: mcp_view::State::default(),
+            decoder: decoder_view::State::default(),
+            comparer: comparer_view::State::default(),
+            comment_edit: None,
         }
         .started(start_mcp)
     }
@@ -1183,6 +1266,7 @@ impl Workbench {
             }
         };
         let scope = self.engine.settings().scope;
+        let annotations = self.engine.project.lock().unwrap().annotations().clone();
         let mut rows: Vec<_> = self
             .rows
             .iter()
@@ -1193,7 +1277,7 @@ impl Workbench {
                     self.websocket_view.reveal_handshake == Some(r.id)
                         || compiled
                             .as_ref()
-                            .is_some_and(|filter| filter.matches(r, &scope))
+                            .is_some_and(|filter| filter.matches(r, &scope, annotations.get(&r.id)))
                 }
             })
             .collect();
@@ -1210,8 +1294,11 @@ impl Workbench {
             &mut self.history_selection[usize::from(intruder_only)],
             &mut self.history_sort[usize::from(intruder_only)],
             &mut self.history_viewport[usize::from(intruder_only)],
-            intruder_only,
-            self.preferences.timezone(),
+            history_table::TableView {
+                intruder: intruder_only,
+                timezone: self.preferences.timezone(),
+                annotations: &annotations,
+            },
         );
         if let Some((ids, action)) = action {
             self.entry_action(ui.ctx(), &ids, action);
@@ -1265,6 +1352,70 @@ impl Workbench {
                     if let Some(text) = self.report(text) {
                         ctx.copy_text(text);
                     }
+                }
+            }
+            EntryAction::CopyMessage(response) => {
+                if let Some(flow) = flows.iter().max_by_key(|flow| flow.id) {
+                    let bytes = if response {
+                        &flow.response
+                    } else {
+                        &flow.request
+                    };
+                    ctx.copy_text(String::from_utf8_lossy(bytes).into_owned());
+                }
+            }
+            EntryAction::Comparer(response, slot) => {
+                if let Some(flow) = flows.iter().max_by_key(|flow| flow.id) {
+                    let part = if response { "response" } else { "request" };
+                    let label = if flow.id == 0 {
+                        format!("Repeater {part}")
+                    } else {
+                        format!("#{} {part}", flow.id)
+                    };
+                    let bytes = if response {
+                        &flow.response
+                    } else {
+                        &flow.request
+                    };
+                    self.send_to_comparer(slot, label, &bytes.clone());
+                }
+            }
+            EntryAction::Decoder(response) => {
+                if let Some(flow) = flows.iter().max_by_key(|flow| flow.id) {
+                    self.decoder.set_input(if response {
+                        &flow.response
+                    } else {
+                        &flow.request
+                    });
+                    self.page = Page::Decoder;
+                }
+            }
+            EntryAction::Highlight(colour) => {
+                let result = {
+                    let mut project = self.engine.project.lock().unwrap();
+                    let changes: Vec<_> = flows
+                        .iter()
+                        .filter(|flow| flow.id != 0)
+                        .map(|flow| {
+                            let mut annotation =
+                                project.annotation(flow.id).cloned().unwrap_or_default();
+                            annotation.highlight = colour;
+                            (flow.id, annotation)
+                        })
+                        .collect();
+                    project.set_annotations(&changes)
+                };
+                self.report(result);
+            }
+            EntryAction::Comment => {
+                let ids: Vec<u64> = flows.iter().map(|f| f.id).filter(|id| *id != 0).collect();
+                let current = ids
+                    .first()
+                    .and_then(|id| self.engine.project.lock().unwrap().annotation(*id).cloned())
+                    .map(|a| a.comment)
+                    .unwrap_or_default();
+                if !ids.is_empty() {
+                    self.comment_edit = Some((ids, current));
                 }
             }
             EntryAction::Repeater => {
@@ -1325,6 +1476,53 @@ impl Workbench {
             }
         }
     }
+    fn comment_dialog(&mut self, ctx: &egui::Context) {
+        let Some((ids, draft)) = &mut self.comment_edit else {
+            return;
+        };
+        let mut save = None;
+        let mut close = false;
+        egui::Modal::new(egui::Id::new("history-comment")).show(ctx, |ui| {
+            ui.heading(if ids.len() == 1 {
+                format!("Comment on #{}", ids[0])
+            } else {
+                format!("Comment on {} exchanges", ids.len())
+            });
+            ui.add(
+                egui::TextEdit::multiline(draft)
+                    .desired_rows(4)
+                    .desired_width(420.0)
+                    .hint_text("Notes are stored in the project and searchable in History"),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    save = Some((ids.clone(), draft.clone()));
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if let Some((ids, comment)) = save {
+            let result = {
+                let mut project = self.engine.project.lock().unwrap();
+                let changes: Vec<_> = ids
+                    .iter()
+                    .map(|id| {
+                        let mut annotation = project.annotation(*id).cloned().unwrap_or_default();
+                        annotation.comment = comment.trim().to_string();
+                        (*id, annotation)
+                    })
+                    .collect();
+                project.set_annotations(&changes)
+            };
+            self.report(result);
+            close = true;
+        }
+        if close {
+            self.comment_edit = None;
+        }
+    }
     fn editor_action(
         &mut self,
         ctx: &egui::Context,
@@ -1365,10 +1563,6 @@ impl Workbench {
         if let Some(e) = &flow.error {
             ui.colored_label(ui.visuals().error_fg_color, e);
         }
-        ui.separator();
-        let [mut request_ui, mut response_ui] = split_panes(ui, "flow-editors", false, 0.5);
-        subsection_heading(&mut request_ui, "Request");
-        subsection_heading(&mut response_ui, "Response");
         let request = message_view(&flow.request, self.response_hex);
         let response = self.response_cache.get(
             flow.id,
@@ -1376,6 +1570,11 @@ impl Workbench {
             self.response_hex,
             self.engine.settings().max_message_bytes,
         );
+        highlight::find_bar(ui, &[("request", &request), ("response", &response)]);
+        ui.separator();
+        let [mut request_ui, mut response_ui] = split_panes(ui, "flow-editors", false, 0.5);
+        subsection_heading(&mut request_ui, "Request");
+        subsection_heading(&mut response_ui, "Response");
         let request_output = http_editor(
             &mut request_ui,
             &mut request.as_str(),
@@ -2124,6 +2323,8 @@ impl eframe::App for Workbench {
                     (Page::Repeater, "Repeater"),
                     (Page::Intruder, "Intruder"),
                     (Page::Scanner, "Scanner"),
+                    (Page::Decoder, "Decoder"),
+                    (Page::Comparer, "Comparer"),
                     (Page::Alerts, &self.alerts.label()),
                     (Page::Plugins, "Plugins"),
                 ] {
@@ -2146,7 +2347,12 @@ impl eframe::App for Workbench {
         egui::CentralPanel::default().show(ctx, |ui| {
             let scroll_page = matches!(
                 self.page,
-                Page::AppSettings | Page::Proxy | Page::Browser | Page::Mcp | Page::Plugins
+                Page::AppSettings
+                    | Page::Proxy
+                    | Page::Browser
+                    | Page::Mcp
+                    | Page::Decoder
+                    | Page::Plugins
             );
             let show_page = |ui: &mut egui::Ui| match self.page {
                 Page::AppSettings => self.projects(ui),
@@ -2180,13 +2386,22 @@ impl eframe::App for Workbench {
                 Page::Repeater => self.repeater(ui),
                 Page::Intruder => self.intruder(ui),
                 Page::Scanner => self.scanner(ui),
+                Page::Decoder => self.decoder(ui),
+                Page::Comparer => self.comparer_page(ui),
                 Page::Proxy => self.settings(ui),
                 Page::Browser => self.browser_page(ui),
                 Page::Mcp => self.mcp_page(ui),
                 Page::Alerts => self.alerts.show(ui, self.preferences.timezone()),
                 Page::Plugins => {
                     ui.heading("Plugins");
-                    ui.label("Plugins are planned for a future release.");
+                    ui.label("Ferrite does not load third-party code yet.");
+                    ui.add_space(6.0);
+                    ui.label("To automate Ferrite or connect AI assistants today, use the MCP server: it exposes history, Repeater, scanner and WebSocket data and in-scope request sending, with permissions, scope enforcement and an audit trail.");
+                    if ui.button("Open MCP settings").clicked() {
+                        self.page = Page::Mcp;
+                    }
+                    ui.add_space(6.0);
+                    ui.weak("A sandboxed WebAssembly plugin system (capability-based, resource-limited, with scope-enforced network access) is proposed in docs/PLUGINS.md.");
                 }
             };
             if scroll_page {
@@ -2201,6 +2416,7 @@ impl eframe::App for Workbench {
         self.switch_dialog(ctx);
         self.browser_dialogs(ctx);
         self.mcp_dialogs(ctx);
+        self.comment_dialog(ctx);
         if let Some(mut export) = self.history_export.take() {
             match export.show(ctx) {
                 ExportOutcome::Saved(message) => self.notify("History", message),

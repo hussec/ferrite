@@ -9,6 +9,7 @@ use std::{
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("metadata");
 const FLOWS: TableDefinition<u64, &[u8]> = TableDefinition::new("exchanges");
+mod annotations;
 mod audit;
 mod scanner;
 mod websockets;
@@ -27,6 +28,7 @@ pub struct Project {
     scan_jobs: BTreeMap<u64, crate::scanner::ScanJob>,
     findings: BTreeMap<u64, crate::scanner::Finding>,
     audit: Vec<crate::mcp::AuditEntry>,
+    annotations: BTreeMap<u64, crate::history::Annotation>,
 }
 
 /// Read access to stored exchanges that does not hold the project lock, so
@@ -107,6 +109,7 @@ impl Project {
             scan_jobs: BTreeMap::new(),
             findings: BTreeMap::new(),
             audit: vec![],
+            annotations: BTreeMap::new(),
         }
         .normalised()
     }
@@ -209,11 +212,13 @@ impl Project {
             scan_jobs: BTreeMap::new(),
             findings: BTreeMap::new(),
             audit: vec![],
+            annotations: BTreeMap::new(),
         }
         .normalised();
         project.load_websockets()?;
         project.load_scanner()?;
         project.load_audit()?;
+        project.load_annotations()?;
         project.save_workspace()?;
         Ok(project)
     }
@@ -284,6 +289,7 @@ impl Project {
                 }
                 tx.open_table(META)?.insert("workspace", bytes.as_slice())?;
                 websockets::delete_tables(&tx, ids)?;
+                annotations::delete_tables(&tx, ids)?;
             }
             tx.commit()?;
         } else {
@@ -295,6 +301,7 @@ impl Project {
         self.ws_sessions.retain(|id, _| !ids.contains(id));
         self.ws_summaries.retain(|(id, _), _| !ids.contains(id));
         self.ws_memory.retain(|(id, _), _| !ids.contains(id));
+        self.annotations.retain(|id, _| !ids.contains(id));
         Ok(())
     }
     pub fn get(&self, id: u64) -> Result<Option<Exchange>> {
@@ -351,6 +358,7 @@ impl Project {
             self.copy_websockets(&mut disk)?;
             self.copy_scanner(&mut disk)?;
             self.copy_audit(&mut disk)?;
+            self.copy_annotations(&mut disk)?;
         }
         // The native save dialog confirms replacement; only replace after the
         // complete project has been written successfully.
@@ -401,6 +409,7 @@ impl Project {
             self.copy_websockets(&mut dest)?;
             self.copy_scanner(&mut dest)?;
             self.copy_audit(&mut dest)?;
+            self.copy_annotations(&mut dest)?;
             Ok(())
         })();
         if result.is_err() {
