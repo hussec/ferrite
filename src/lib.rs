@@ -1,5 +1,6 @@
 #[cfg(feature = "gui")]
 pub mod app;
+pub mod browser;
 pub mod display_timezone;
 pub mod engine;
 pub mod history;

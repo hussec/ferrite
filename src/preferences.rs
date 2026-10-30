@@ -1,6 +1,7 @@
 //! Application-wide appearance and CA identity, independent of project files.
 use crate::{
-    display_timezone::DisplayTimezone, model::ColorScheme, project::Project, tls::Authority,
+    browser::BrowserSettings, display_timezone::DisplayTimezone, model::ColorScheme,
+    project::Project, tls::Authority,
 };
 use anyhow::{Context, Result};
 use fs2::FileExt;
@@ -16,6 +17,8 @@ struct Stored {
     ca_key: Vec<u8>,
     #[serde(default)]
     timezone: DisplayTimezone,
+    #[serde(default)]
+    browser: BrowserSettings,
 }
 
 pub struct Preferences {
@@ -39,6 +42,7 @@ impl Preferences {
             let stored = Stored {
                 color_scheme: project.workspace.color_scheme,
                 timezone: DisplayTimezone::default(),
+                browser: BrowserSettings::default(),
                 ca_key: match project.ca_key() {
                     Some(key) => key,
                     None => Authority::generate_key()?,
@@ -107,6 +111,20 @@ impl Preferences {
         let updated = Self::with_lock(&self.path, || {
             let mut latest = Self::read(&self.path)?;
             latest.stored.timezone = timezone;
+            latest.write(true)?;
+            Ok(latest.stored)
+        })?;
+        self.stored = updated;
+        Ok(())
+    }
+    pub fn browser(&self) -> &BrowserSettings {
+        &self.stored.browser
+    }
+    pub fn set_browser(&mut self, browser: BrowserSettings) -> Result<()> {
+        browser.validate()?;
+        let updated = Self::with_lock(&self.path, || {
+            let mut latest = Self::read(&self.path)?;
+            latest.stored.browser = browser;
             latest.write(true)?;
             Ok(latest.stored)
         })?;
@@ -235,6 +253,21 @@ mod tests {
         let mut first = Preferences::load_at(&path, &project).unwrap();
         let mut second = Preferences::load_at(&path, &project).unwrap();
         assert_eq!(first.timezone(), DisplayTimezone::Utc);
+        assert_eq!(first.browser(), &BrowserSettings::default());
+        let browser = BrowserSettings {
+            profile: crate::browser::ProfileMode::Persistent,
+            extra_args: vec!["--lang=en-AU".into()],
+            ..Default::default()
+        };
+        second.set_browser(browser.clone()).unwrap();
+        assert!(
+            second
+                .set_browser(BrowserSettings {
+                    extra_args: vec!["--proxy-server=direct://".into()],
+                    ..Default::default()
+                })
+                .is_err()
+        );
         first
             .set_timezone(DisplayTimezone::Named(chrono_tz::Asia::Kolkata))
             .unwrap();
@@ -245,6 +278,7 @@ mod tests {
             DisplayTimezone::Named(chrono_tz::Asia::Kolkata)
         );
         assert_eq!(reloaded.scheme(), ColorScheme::Light);
+        assert_eq!(reloaded.browser(), &browser);
         assert_eq!(
             Authority::from_key(reloaded.ca_key())
                 .unwrap()

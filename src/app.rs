@@ -9,6 +9,7 @@ use crate::{
 };
 use eframe::egui::{self, Color32, RichText};
 mod alerts;
+mod browser_view;
 mod editor_context;
 mod history_export;
 mod history_filters;
@@ -46,6 +47,7 @@ enum Page {
     Intruder,
     Scanner,
     Proxy,
+    Browser,
     Alerts,
     Plugins,
 }
@@ -56,6 +58,7 @@ enum FileAction {
     SaveProject,
     ExportCertificate,
     LoadPayloadSet(usize),
+    BrowserExecutable,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SwitchAction {
@@ -80,6 +83,7 @@ enum Event {
     Started(Result<Listener>),
     Repeater(usize, Result<Exchange>),
     AttackDone(Result<usize>),
+    Browser(browser_view::BrowserEvent),
 }
 pub struct Workbench {
     engine: Arc<Engine>,
@@ -130,6 +134,7 @@ pub struct Workbench {
     websocket_intercept: bool,
     timezone_search: String,
     scanner_view: scanner_view::State,
+    browser: browser_view::State,
 }
 fn hex(bytes: &[u8]) -> String {
     bytes
@@ -518,6 +523,7 @@ impl Workbench {
             websocket_intercept: false,
             timezone_search: String::new(),
             scanner_view: scanner_view::State::default(),
+            browser: browser_view::State::default(),
         }
     }
     fn report<T>(&mut self, result: Result<T>) -> Option<T> {
@@ -555,7 +561,15 @@ impl Workbench {
                         self.notify("Proxy", format!("Listening on {}", listener.address));
                         self.listener = Some(listener);
                     }
+                    if self.browser.launch_after_start {
+                        if self.listener.is_some() {
+                            self.launch_browser();
+                        } else {
+                            self.browser.launch_after_start = false;
+                        }
+                    }
                 }
+                Event::Browser(event) => self.browser_event(event),
                 Event::Repeater(index, result) => {
                     self.repeater_busy.retain(|i| *i != index);
                     if let Some(flow) = self.report(result) {
@@ -768,6 +782,9 @@ impl Workbench {
                     .set_title(format!("Load payload set {}", index + 1))
                     .add_filter("Payload list", &["txt", "lst", "csv"])
                     .pick_file(),
+                FileAction::BrowserExecutable => rfd::FileDialog::new()
+                    .set_title("Choose a Chromium-family browser executable")
+                    .pick_file(),
             };
             let _ = tx.send(Event::FileDialog(action, path));
             ctx.request_repaint();
@@ -810,6 +827,7 @@ impl Workbench {
                     self.switch_state = None;
                 }
             }
+            FileAction::BrowserExecutable => self.complete_browser_pick(path),
             FileAction::ExportCertificate => {
                 let result =
                     std::fs::write(&path, self.engine.authority.pem()).map_err(anyhow::Error::from);
@@ -1081,7 +1099,7 @@ impl Workbench {
                 }
             }
         });
-        ui.label("Import this public certificate into your test browser's certificate authorities to intercept HTTPS.");
+        ui.label("The built-in browser (Open browser) trusts this CA automatically, only inside its isolated profile. For other browsers or devices, import this public certificate as a certificate authority to intercept HTTPS.");
         ui.label(format!(
             "Current CA SHA-256 fingerprint: {}",
             self.engine.authority.fingerprint()
@@ -2081,6 +2099,8 @@ impl Workbench {
                     .map(|listener| listener.address.to_string())
                     .unwrap_or_else(|| self.engine.settings().listen),
             );
+            ui.separator();
+            self.browser_controls(ui);
         });
         ui.separator();
         let parsed = serde_json::from_str::<crate::model::Settings>(&self.settings_json);
@@ -2251,6 +2271,7 @@ fn timestamp(milliseconds: u64, timezone: DisplayTimezone) -> String {
 impl eframe::App for Workbench {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.refresh();
+        self.poll_browser(ctx);
         self.advance_switch(ctx);
         json_preview::configure(
             ctx,
@@ -2275,10 +2296,14 @@ impl eframe::App for Workbench {
                 ui.label(self.engine.project.lock().unwrap().workspace.name.clone());
                 ui.separator();
                 ui.label(if self.engine.is_running() {
-                    "● Proxy running"
+                    "⏺ Proxy running"
                 } else {
                     "○ Proxy stopped"
                 });
+                if self.browser.process.is_some() {
+                    ui.separator();
+                    ui.label("⏺ Browser open");
+                }
             });
         });
         egui::SidePanel::left("nav")
@@ -2288,6 +2313,7 @@ impl eframe::App for Workbench {
                 for (page, name) in [
                     (Page::AppSettings, "Settings"),
                     (Page::Proxy, "Proxy"),
+                    (Page::Browser, "Browser"),
                     (Page::Target, "Target"),
                     (Page::Intercept, "Intercept"),
                     (Page::History, "History"),
@@ -2314,7 +2340,10 @@ impl eframe::App for Workbench {
             });
         });
         egui::CentralPanel::default().show(ctx, |ui| {
-            let scroll_page = matches!(self.page, Page::AppSettings | Page::Proxy | Page::Plugins);
+            let scroll_page = matches!(
+                self.page,
+                Page::AppSettings | Page::Proxy | Page::Browser | Page::Plugins
+            );
             let show_page = |ui: &mut egui::Ui| match self.page {
                 Page::AppSettings => self.projects(ui),
                 Page::Target => self.target(ui),
@@ -2348,6 +2377,7 @@ impl eframe::App for Workbench {
                 Page::Intruder => self.intruder(ui),
                 Page::Scanner => self.scanner(ui),
                 Page::Proxy => self.settings(ui),
+                Page::Browser => self.browser_page(ui),
                 Page::Alerts => self.alerts.show(ui, self.preferences.timezone()),
                 Page::Plugins => {
                     ui.heading("Plugins");
@@ -2364,6 +2394,7 @@ impl eframe::App for Workbench {
             }
         });
         self.switch_dialog(ctx);
+        self.browser_dialogs(ctx);
         if let Some(mut export) = self.history_export.take() {
             match export.show(ctx) {
                 ExportOutcome::Saved(message) => self.notify("History", message),
@@ -2384,6 +2415,7 @@ impl eframe::App for Workbench {
         if let Some(cancel) = &self.attack_cancel {
             let _ = cancel.send(true);
         }
+        self.shutdown_browser();
         self.stop();
         self.persist();
     }

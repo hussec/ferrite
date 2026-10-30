@@ -1117,6 +1117,7 @@ dependencies = [
  "redb",
  "regex",
  "rfd",
+ "rustix 1.1.5",
  "rustls",
  "rustls-rustcrypto",
  "ruzstd",
