@@ -221,8 +221,14 @@ pub struct Exchange {
     pub error: Option<String>,
     pub note: String,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepeaterTab {
+    /// Stable identity used by the UI and MCP clients; 0 until assigned.
+    #[serde(default)]
+    pub id: u64,
+    /// Optional collection the tab is grouped under.
+    #[serde(default)]
+    pub group: String,
     pub name: String,
     pub destination: String,
     #[serde(default)]
@@ -305,6 +311,8 @@ impl Default for Workspace {
             color_scheme: ColorScheme::default(),
             settings: Settings::default(),
             repeater: vec![RepeaterTab {
+                id: 1,
+                group: String::new(),
                 name: "1".into(),
                 destination: "https://example.com".into(),
                 request_hex: false,
@@ -316,6 +324,30 @@ impl Default for Workspace {
             beautify_json: true,
             websocket_state_filter: None,
         }
+    }
+}
+
+impl Workspace {
+    /// Give every Repeater tab a unique non-zero ID, keeping existing ones.
+    pub fn assign_repeater_ids(&mut self) {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut next = self.repeater.iter().map(|t| t.id).max().unwrap_or(0);
+        for tab in &mut self.repeater {
+            if tab.id == 0 || !seen.insert(tab.id) {
+                next += 1;
+                tab.id = next;
+                seen.insert(next);
+            }
+        }
+    }
+    pub fn next_repeater_id(&self) -> u64 {
+        self.repeater.iter().map(|t| t.id).max().unwrap_or(0) + 1
+    }
+    pub fn repeater_tab(&self, id: u64) -> Option<&RepeaterTab> {
+        self.repeater.iter().find(|t| t.id == id)
+    }
+    pub fn repeater_tab_mut(&mut self, id: u64) -> Option<&mut RepeaterTab> {
+        self.repeater.iter_mut().find(|t| t.id == id)
     }
 }
 

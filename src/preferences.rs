@@ -1,7 +1,7 @@
 //! Application-wide appearance and CA identity, independent of project files.
 use crate::{
-    browser::BrowserSettings, display_timezone::DisplayTimezone, model::ColorScheme,
-    project::Project, tls::Authority,
+    browser::BrowserSettings, display_timezone::DisplayTimezone, mcp::McpSettings,
+    model::ColorScheme, project::Project, tls::Authority,
 };
 use anyhow::{Context, Result};
 use fs2::FileExt;
@@ -19,6 +19,8 @@ struct Stored {
     timezone: DisplayTimezone,
     #[serde(default)]
     browser: BrowserSettings,
+    #[serde(default)]
+    mcp: McpSettings,
 }
 
 pub struct Preferences {
@@ -43,6 +45,7 @@ impl Preferences {
                 color_scheme: project.workspace.color_scheme,
                 timezone: DisplayTimezone::default(),
                 browser: BrowserSettings::default(),
+                mcp: McpSettings::default(),
                 ca_key: match project.ca_key() {
                     Some(key) => key,
                     None => Authority::generate_key()?,
@@ -125,6 +128,20 @@ impl Preferences {
         let updated = Self::with_lock(&self.path, || {
             let mut latest = Self::read(&self.path)?;
             latest.stored.browser = browser;
+            latest.write(true)?;
+            Ok(latest.stored)
+        })?;
+        self.stored = updated;
+        Ok(())
+    }
+    pub fn mcp(&self) -> &McpSettings {
+        &self.stored.mcp
+    }
+    pub fn set_mcp(&mut self, mcp: McpSettings) -> Result<()> {
+        mcp.validate()?;
+        let updated = Self::with_lock(&self.path, || {
+            let mut latest = Self::read(&self.path)?;
+            latest.stored.mcp = mcp;
             latest.write(true)?;
             Ok(latest.stored)
         })?;
@@ -254,6 +271,11 @@ mod tests {
         let mut second = Preferences::load_at(&path, &project).unwrap();
         assert_eq!(first.timezone(), DisplayTimezone::Utc);
         assert_eq!(first.browser(), &BrowserSettings::default());
+        // MCP is opt-in and asks before sending requests by default.
+        assert!(!first.mcp().enabled);
+        assert_eq!(first.mcp().send_requests, crate::mcp::Permission::Ask);
+        assert_eq!(first.mcp().active_scans, crate::mcp::Permission::Deny);
+        assert!(!first.mcp().include_credentials);
         let browser = BrowserSettings {
             profile: crate::browser::ProfileMode::Persistent,
             extra_args: vec!["--lang=en-AU".into()],

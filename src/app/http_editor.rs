@@ -1,12 +1,5 @@
 use eframe::egui;
 
-pub(super) fn is_display_text(bytes: &[u8]) -> bool {
-    std::str::from_utf8(bytes).is_ok_and(|text| {
-        text.chars()
-            .all(|c| !c.is_control() || matches!(c, '\r' | '\n' | '\t'))
-    })
-}
-
 pub(super) fn message_view(bytes: &[u8], all_hex: bool) -> String {
     if all_hex {
         return super::hex(bytes);
