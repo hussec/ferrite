@@ -1017,7 +1017,7 @@ fn text_body(message: &Message, limit: usize) -> Option<String> {
         let start =
             usize::from(body.starts_with(&[0xff, 0xfe]) || body.starts_with(&[0xfe, 0xff])) * 2;
         let mut text = String::new();
-        let units = body[start..].chunks_exact(2).map(|pair| {
+        let units = body[start..].as_chunks::<2>().0.iter().map(|pair| {
             if big {
                 u16::from_be_bytes([pair[0], pair[1]])
             } else {

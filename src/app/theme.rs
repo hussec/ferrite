@@ -159,7 +159,7 @@ pub fn apply(ctx: &egui::Context, scheme: ColorScheme) {
         visuals.widgets.open.bg_fill = mix(widget, accent, 15);
         visuals.widgets.open.weak_bg_fill = visuals.widgets.open.bg_fill;
         visuals.selection.bg_fill = mix(panel, accent, 35);
-        visuals.selection.stroke = Stroke::new(1.0, color(accent));
+        visuals.selection.stroke = Stroke::new(1.0_f32, color(accent));
         visuals.hyperlink_color = color(accent);
     }
     // set_visuals only changes the active egui style; it does not select a theme.

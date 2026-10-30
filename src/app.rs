@@ -305,7 +305,7 @@ fn split_panes(ui: &mut egui::Ui, id: &str, vertical: bool, initial: f32) -> [eg
     let (first, second) = if vertical {
         let y = rect.top() + offset;
         ui.painter()
-            .hline(rect.x_range(), y + 4.0, egui::Stroke::new(2.0, color));
+            .hline(rect.x_range(), y + 4.0, egui::Stroke::new(2.0_f32, color));
         (
             egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), y)),
             egui::Rect::from_min_max(egui::pos2(rect.left(), y + 8.0), rect.max),
@@ -313,7 +313,7 @@ fn split_panes(ui: &mut egui::Ui, id: &str, vertical: bool, initial: f32) -> [eg
     } else {
         let x = rect.left() + offset;
         ui.painter()
-            .vline(x + 4.0, rect.y_range(), egui::Stroke::new(2.0, color));
+            .vline(x + 4.0, rect.y_range(), egui::Stroke::new(2.0_f32, color));
         (
             egui::Rect::from_min_max(rect.min, egui::pos2(x, rect.bottom())),
             egui::Rect::from_min_max(egui::pos2(x + 8.0, rect.top()), rect.max),
